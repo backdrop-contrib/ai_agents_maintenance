@@ -1,0 +1,6 @@
+name = AI Agents Maintenance
+description = Maintenance and monitoring tools for AI agents.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = ai_agents

@@ -1,0 +1,457 @@
+<?php
+
+
+/**
+ * @file
+ * Cron-backed maintenance queue with approval gates.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function ai_agents_maintenance_permission() {
+  return [
+    'administer ai maintenance' => [
+      'title' => t('Administer AI maintenance'),
+      'description' => t('Review, approve, and execute maintenance candidates.'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ai_agents_maintenance_menu() {
+  $items = [];
+
+  $items['admin/config/ai/ai-agents/maintenance'] = [
+    'title' => 'AI Maintenance',
+    'description' => 'Review and approve small automated site cleanup tasks.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_maintenance_dashboard_form'],
+    'access arguments' => ['administer ai maintenance'],
+    'file' => 'includes/ai_agents_maintenance.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  ];
+
+  $items['admin/config/ai/ai-agents/maintenance/dashboard'] = [
+    'title' => 'Overview',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  ];
+
+  $items['admin/config/ai/ai-agents/maintenance/queue'] = [
+    'title' => 'Queue',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_maintenance_queue_form'],
+    'access arguments' => ['administer ai maintenance'],
+    'file' => 'includes/ai_agents_maintenance.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 0,
+  ];
+
+  $items['admin/config/ai/ai-agents/maintenance/log'] = [
+    'title' => 'Log',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_maintenance_log_form'],
+    'access arguments' => ['administer ai maintenance'],
+    'file' => 'includes/ai_agents_maintenance.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  ];
+
+  $items['admin/config/ai/ai-agents/maintenance/settings'] = [
+    'title' => 'Settings',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_agents_maintenance_settings_form'],
+    'access arguments' => ['administer ai maintenance'],
+    'file' => 'includes/ai_agents_maintenance.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 20,
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_config_info().
+ */
+function ai_agents_maintenance_config_info() {
+  return [
+    'ai_agents_maintenance.settings' => [
+      'label' => t('AI Agent Maintenance settings'),
+      'group' => t('AI'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ai_agents_maintenance_cron() {
+  $config = config('ai_agents_maintenance.settings');
+
+  if (!$config->get('cron_enabled')) {
+    return;
+  }
+
+  $interval = (int) ($config->get('cron_interval') ?: 86400);
+  $last_run = (int) $config->get('cron_last_run');
+  if (REQUEST_TIME - $last_run < $interval) {
+    return;
+  }
+
+  $apply_limit = (int) ($config->get('apply_batch_size') ?: 5);
+  $queued = 0;
+
+  // Run each configured assistant.
+  $scheduled = $config->get('scheduled_assistants');
+  if (!empty($scheduled) && is_array($scheduled) && module_exists('ai_assistant')) {
+    foreach ($scheduled as $entry) {
+      if (empty($entry['assistant_id']) || empty($entry['enabled'])) {
+        continue;
+      }
+      $prompt = !empty($entry['prompt']) ? $entry['prompt'] : 'Run your maintenance scan now and queue any proposals.';
+      $result = ai_assistant_send($entry['assistant_id'], $prompt, ['uid' => 1]);
+      if (!empty($result['error'])) {
+        watchdog('ai_agents_maintenance', 'Assistant @id error: @err', ['@id' => $entry['assistant_id'], '@err' => $result['error']], WATCHDOG_WARNING);
+      }
+      else {
+        $queued++;
+      }
+    }
+  }
+
+  $applied = ai_agents_maintenance_apply_approved_items($apply_limit);
+  $config->set('cron_last_run', REQUEST_TIME)->save();
+
+  watchdog('ai_agents_maintenance', 'Cron: ran @queued assistant(s), applied @applied item(s).', [
+    '@queued' => $queued,
+    '@applied' => $applied,
+  ]);
+}
+
+/**
+ * Return a unique run identifier.
+ */
+function ai_agents_maintenance_run_id() {
+  return REQUEST_TIME . '-' . substr(hash('sha256', mt_rand() . microtime(TRUE)), 0, 8);
+}
+
+/**
+ * Scan for alt text candidates and queue them for review.
+ */
+function ai_agents_maintenance_scan_alt_candidates($limit = 10, $run_id = '') {
+  module_load_include('inc', 'ai_alt_tools', 'includes/alt.tools');
+  if (!function_exists('ai_alt_tools_execute_find_images_missing_alt') || !function_exists('ai_alt_tools_find_alt_from_usage')) {
+    return ['queued' => 0, 'skipped' => 0];
+  }
+
+  $limit = max(1, (int) $limit);
+  $run_id = $run_id !== '' ? $run_id : ai_agents_maintenance_run_id();
+  $result = ai_alt_tools_execute_find_images_missing_alt([
+    'limit' => $limit,
+    'include_inline' => FALSE,
+  ]);
+  if (!empty($result['error']) || empty($result['images']) || !is_array($result['images'])) {
+    return ['queued' => 0, 'skipped' => 0];
+  }
+
+  $queued = 0;
+  $skipped = 0;
+
+  foreach ($result['images'] as $row) {
+    if (empty($row['fid'])) {
+      continue;
+    }
+
+    $file = file_load((int) $row['fid']);
+    if (!$file || strpos((string) $file->filemime, 'image/') !== 0) {
+      continue;
+    }
+
+    if (ai_agents_maintenance_queue_exists('file_alt_from_usage', 'file', $file->fid, $file->fid)) {
+      $skipped++;
+      continue;
+    }
+
+    $seed = ai_alt_tools_find_alt_from_usage($file);
+    if ($seed === FALSE || empty($seed['alt_text'])) {
+      $skipped++;
+      continue;
+    }
+
+    $candidate = ai_agents_maintenance_build_alt_candidate($file, $seed, $run_id);
+    if (empty($candidate)) {
+      $skipped++;
+      continue;
+    }
+
+    ai_agents_maintenance_queue_insert($candidate);
+    $queued++;
+  }
+
+  if ($queued || $skipped) {
+    watchdog('ai_agents_maintenance', 'Scan run @run_id queued @queued candidate(s) and skipped @skipped item(s).', [
+      '@run_id' => $run_id,
+      '@queued' => $queued,
+      '@skipped' => $skipped,
+    ]);
+  }
+
+  return [
+    'queued' => $queued,
+    'skipped' => $skipped,
+  ];
+}
+
+/**
+ * Build one queued maintenance candidate for an image file.
+ */
+function ai_agents_maintenance_build_alt_candidate($file, array $seed, $run_id) {
+  $source = !empty($seed['source']) && is_array($seed['source']) ? $seed['source'] : [];
+  $alt_text = trim((string) $seed['alt_text']);
+  if ($alt_text === '') {
+    return [];
+  }
+
+  $reason = t('Found existing alt text in file usage.');
+  if (!empty($source['type']) && !empty($source['id'])) {
+    $reason = t('Found existing alt text in @type @id.', [
+      '@type' => $source['type'],
+      '@id' => $source['id'],
+    ]);
+    if ($source['type'] === 'node') {
+      $node = node_load((int) $source['id']);
+      if ($node) {
+        $reason = t('Found existing alt text in node "@title".', [
+          '@title' => $node->title,
+        ]);
+      }
+    }
+  }
+
+  return [
+    'task_type' => 'file_alt_from_usage',
+    'entity_type' => 'file',
+    'entity_id' => (int) $file->fid,
+    'bundle' => !empty($file->type) ? $file->type : 'image',
+    'source_fid' => (int) $file->fid,
+    'before_value' => ai_agents_maintenance_current_file_alt($file),
+    'after_value' => $alt_text,
+    'reason' => (string) $reason,
+    'status' => 'pending',
+    'run_id' => (string) $run_id,
+    'created' => REQUEST_TIME,
+    'updated' => REQUEST_TIME,
+    'approved_by' => 0,
+    'approved_at' => 0,
+    'applied_at' => 0,
+    'error_message' => '',
+  ];
+}
+
+/**
+ * Load the current global alt text for a file.
+ */
+function ai_agents_maintenance_current_file_alt($file) {
+  if (function_exists('ai_alt_tools_get_file_alt_text')) {
+    return ai_alt_tools_get_file_alt_text($file);
+  }
+  return '';
+}
+
+/**
+ * Check whether an equivalent queue row already exists.
+ */
+function ai_agents_maintenance_queue_exists($task_type, $entity_type, $entity_id, $source_fid = 0) {
+  $query = db_select('ai_agents_maintenance_queue', 'q')
+    ->fields('q', ['qid'])
+    ->condition('task_type', $task_type)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', (int) $entity_id)
+    ->range(0, 1);
+  if (!empty($source_fid)) {
+    $query->condition('source_fid', (int) $source_fid);
+  }
+  return (bool) $query->execute()->fetchField();
+}
+
+/**
+ * Insert a queue row.
+ */
+function ai_agents_maintenance_queue_insert(array $values) {
+  db_insert('ai_agents_maintenance_queue')
+    ->fields($values)
+    ->execute();
+}
+
+/**
+ * Return queue items.
+ */
+function ai_agents_maintenance_get_queue_items($limit = 50, $status = '') {
+  $query = db_select('ai_agents_maintenance_queue', 'q')
+    ->fields('q')
+    ->orderBy('created', 'DESC')
+    ->range(0, (int) $limit);
+  if ($status !== '') {
+    $query->condition('status', $status);
+  }
+  return $query->execute()->fetchAllAssoc('qid', PDO::FETCH_ASSOC);
+}
+
+/**
+ * Return queue counts by status.
+ */
+function ai_agents_maintenance_queue_counts() {
+  $query = db_select('ai_agents_maintenance_queue', 'q')
+    ->fields('q', ['status']);
+  $query->addExpression('COUNT(*)', 'count');
+  $query->groupBy('status');
+
+  $counts = [];
+  foreach ($query->execute() as $row) {
+    $counts[$row->status] = (int) $row->count;
+  }
+  return $counts;
+}
+
+/**
+ * Return recent queue rows.
+ */
+function ai_agents_maintenance_recent_items($limit = 20) {
+  return ai_agents_maintenance_get_queue_items($limit);
+}
+
+/**
+ * Mark queue rows with a new status.
+ */
+function ai_agents_maintenance_update_queue_status(array $qids, $status, $user_id = 0, $error_message = '') {
+  if (empty($qids)) {
+    return 0;
+  }
+
+  $update = db_update('ai_agents_maintenance_queue')
+    ->fields([
+      'status' => $status,
+      'updated' => REQUEST_TIME,
+    ])
+    ->condition('qid', $qids, 'IN');
+
+  if ($status === 'approved') {
+    $update->fields([
+      'approved_by' => (int) $user_id,
+      'approved_at' => REQUEST_TIME,
+    ]);
+  }
+  elseif ($status === 'applied') {
+    $update->fields([
+      'applied_at' => REQUEST_TIME,
+    ]);
+  }
+  if ($error_message !== '') {
+    $update->fields([
+      'error_message' => $error_message,
+    ]);
+  }
+
+  return $update->execute();
+}
+
+/**
+ * Apply approved queue rows.
+ */
+function ai_agents_maintenance_apply_approved_items($limit = 5) {
+  $items = ai_agents_maintenance_get_queue_items($limit, 'approved');
+  $applied = 0;
+
+  foreach ($items as $item) {
+    if (ai_agents_maintenance_apply_queue_item($item)) {
+      $applied++;
+    }
+  }
+
+  return $applied;
+}
+
+/**
+ * Apply one queue row.
+ */
+function ai_agents_maintenance_apply_queue_item(array $item) {
+  if (empty($item['qid']) || $item['task_type'] !== 'file_alt_from_usage') {
+    return FALSE;
+  }
+
+  $file = file_load((int) $item['entity_id']);
+  if (!$file) {
+    db_update('ai_agents_maintenance_queue')
+      ->fields([
+        'status' => 'failed',
+        'updated' => REQUEST_TIME,
+        'error_message' => 'File no longer exists.',
+      ])
+      ->condition('qid', (int) $item['qid'])
+      ->execute();
+    return FALSE;
+  }
+
+  $current = ai_agents_maintenance_current_file_alt($file);
+  $expected_before = isset($item['before_value']) ? trim((string) $item['before_value']) : '';
+  $new_value = isset($item['after_value']) ? trim((string) $item['after_value']) : '';
+
+  if ($new_value === '') {
+    db_update('ai_agents_maintenance_queue')
+      ->fields([
+        'status' => 'failed',
+        'updated' => REQUEST_TIME,
+        'error_message' => 'Queued alt text was empty.',
+      ])
+      ->condition('qid', (int) $item['qid'])
+      ->execute();
+    return FALSE;
+  }
+
+  if ($current !== '' && $current !== $new_value && $current !== $expected_before) {
+    db_update('ai_agents_maintenance_queue')
+      ->fields([
+        'status' => 'failed',
+        'updated' => REQUEST_TIME,
+        'error_message' => 'Current alt text changed before apply.',
+      ])
+      ->condition('qid', (int) $item['qid'])
+      ->execute();
+    return FALSE;
+  }
+
+  if (function_exists('ai_alt_tools_set_file_alt_text')) {
+    ai_alt_tools_set_file_alt_text($file, $new_value);
+  }
+  else {
+    $alt_field = function_exists('image_entity_alt_field_name') ? image_entity_alt_field_name() : 'field_alt';
+    $file->{$alt_field} = [
+      LANGUAGE_NONE => [
+        [
+          'value' => $new_value,
+        ],
+      ],
+    ];
+    file_save($file);
+  }
+
+  db_update('ai_agents_maintenance_queue')
+    ->fields([
+      'status' => 'applied',
+      'updated' => REQUEST_TIME,
+      'applied_at' => REQUEST_TIME,
+      'error_message' => '',
+    ])
+    ->condition('qid', (int) $item['qid'])
+    ->execute();
+
+  watchdog('ai_agents_maintenance', 'Applied queued maintenance item @qid to fid @fid.', [
+    '@qid' => $item['qid'],
+    '@fid' => $file->fid,
+  ]);
+
+  return TRUE;
+}

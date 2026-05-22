@@ -1,0 +1,147 @@
+<?php
+
+/**
+ * @file
+ * Install and update functions for AI Agent Maintenance.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function ai_agents_maintenance_install() {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  ai_upgrade_module_install('ai_agents_maintenance');
+}
+
+/**
+ * Implements hook_schema().
+ */
+function ai_agents_maintenance_schema() {
+  $schema = array();
+
+  $schema['ai_agents_maintenance_queue'] = array(
+    'description' => 'Stores proposed maintenance changes awaiting approval or execution.',
+    'fields' => array(
+      'qid' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+      ),
+      'task_type' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'entity_type' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'entity_id' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'bundle' => array(
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'source_fid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'before_value' => array(
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'after_value' => array(
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'reason' => array(
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+      'status' => array(
+        'type' => 'varchar',
+        'length' => 16,
+        'not null' => TRUE,
+        'default' => 'pending',
+      ),
+      'run_id' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'created' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'updated' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'approved_by' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'approved_at' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'applied_at' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'error_message' => array(
+        'type' => 'text',
+        'size' => 'big',
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('qid'),
+    'indexes' => array(
+      'status' => array('status'),
+      'task_type' => array('task_type'),
+      'entity_lookup' => array('entity_type', 'entity_id'),
+      'source_fid' => array('source_fid'),
+      'run_id' => array('run_id'),
+      'created' => array('created'),
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Create maintenance queue storage.
+ */
+function ai_agents_maintenance_update_1000() {
+  $schema = ai_agents_maintenance_schema();
+  if (!db_table_exists('ai_agents_maintenance_queue')) {
+    db_create_table('ai_agents_maintenance_queue', $schema['ai_agents_maintenance_queue']);
+  }
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function ai_agents_maintenance_requirements($phase) {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  return ai_upgrade_module_requirements($phase, 'ai_agents_maintenance');
+}
