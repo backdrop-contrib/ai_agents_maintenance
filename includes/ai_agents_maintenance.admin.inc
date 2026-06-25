@@ -259,6 +259,14 @@ function ai_agents_maintenance_settings_form($form, &$form_state) {
     '#options' => [1 => 1, 5 => 5, 10 => 10, 25 => 25],
     '#default_value' => $config->get('apply_batch_size') ?: 5,
   ];
+  $form['cron']['cron_uid'] = [
+    '#type' => 'textfield',
+    '#title' => t('Cron service account UID'),
+    '#description' => t('User ID to impersonate during scheduled assistant runs. Create a dedicated account with only the permissions required for maintenance tasks rather than using uid 1. Defaults to 1 if left empty.'),
+    '#default_value' => $config->get('cron_uid') ?: '',
+    '#size' => 10,
+    '#element_validate' => ['element_validate_integer_positive'],
+  ];
 
   $form['assistants'] = [
     '#type' => 'fieldset',
@@ -344,6 +352,8 @@ function ai_agents_maintenance_settings_form_submit($form, &$form_state) {
   $config->set('cron_enabled', !empty($form_state['values']['cron_enabled']) ? 1 : 0);
   $config->set('cron_interval', (int) $form_state['values']['cron_interval']);
   $config->set('apply_batch_size', (int) $form_state['values']['apply_batch_size']);
+  $cron_uid = (int) $form_state['values']['cron_uid'];
+  $config->set('cron_uid', $cron_uid > 0 ? $cron_uid : 0);
 
   $scheduled = [];
   if (!empty($form_state['values']['assistants']) && is_array($form_state['values']['assistants'])) {

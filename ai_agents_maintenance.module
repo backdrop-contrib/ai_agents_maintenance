@@ -108,13 +108,16 @@ function ai_agents_maintenance_cron() {
   $scheduled = $config->get('scheduled_assistants');
   if (!empty($scheduled) && is_array($scheduled) && module_exists('ai_assistants')) {
     // Assistants enforce allowed_roles against the current user, and ai_tools
-    // filters tools by permission. Cron runs as anonymous, so impersonate
-    // user 1 for the scheduled runs and restore afterwards.
+    // filters tools by permission. Cron runs as anonymous, so impersonate a
+    // dedicated service account for the scheduled runs and restore afterwards.
+    // Defaults to uid 1 when no service account is configured; set
+    // cron_uid in the module settings to use a least-privilege account.
     global $user;
     $original_user = $user;
     $session_state = backdrop_save_session();
     backdrop_save_session(FALSE);
-    $user = user_load(1);
+    $cron_uid = (int) ($config->get('cron_uid') ?: 1);
+    $user = user_load($cron_uid) ?: user_load(1);
 
     try {
       foreach ($scheduled as $entry) {
@@ -279,7 +282,7 @@ function ai_agents_maintenance_execute_propose_change(array $args) {
     }
   }
 
-  if (ai_agents_maintenance_queue_exists($task_type, $entity_type, $entity_id, $source_fid)) {
+  if (ai_agents_maintenance_queue_exists($task_type, $entity_type, $entity_id, $source_fid, $after_value)) {
     return [
       'status' => 'duplicate',
       'message' => 'An equivalent proposal is already queued for this target.',
@@ -469,15 +472,20 @@ function ai_agents_maintenance_current_file_alt($file) {
 /**
  * Check whether an equivalent queue row already exists.
  */
-function ai_agents_maintenance_queue_exists($task_type, $entity_type, $entity_id, $source_fid = 0) {
+function ai_agents_maintenance_queue_exists($task_type, $entity_type, $entity_id, $source_fid = 0, $after_value = NULL) {
+  $active_statuses = ['pending', 'queued', 'approved'];
   $query = db_select('ai_agents_maintenance_queue', 'q')
     ->fields('q', ['qid'])
     ->condition('task_type', $task_type)
     ->condition('entity_type', $entity_type)
     ->condition('entity_id', (int) $entity_id)
+    ->condition('status', $active_statuses, 'IN')
     ->range(0, 1);
   if (!empty($source_fid)) {
     $query->condition('source_fid', (int) $source_fid);
+  }
+  if ($after_value !== NULL) {
+    $query->condition('after_value', $after_value);
   }
   return (bool) $query->execute()->fetchField();
 }
@@ -540,19 +548,13 @@ function ai_agents_maintenance_update_queue_status(array $qids, $status, $user_i
   // UpdateQuery::fields() replaces the field array, it does not merge, so
   // chaining a second call silently drops the status change.
   $fields = [
-    'status' => $status,
-    'updated' => REQUEST_TIME,
+    'status'        => $status,
+    'updated'       => REQUEST_TIME,
+    'error_message' => $status === 'failed' ? $error_message : '',
+    'approved_by'   => $status === 'approved' ? (int) $user_id : 0,
+    'approved_at'   => $status === 'approved' ? REQUEST_TIME : 0,
+    'applied_at'    => $status === 'applied'  ? REQUEST_TIME : 0,
   ];
-  if ($status === 'approved') {
-    $fields['approved_by'] = (int) $user_id;
-    $fields['approved_at'] = REQUEST_TIME;
-  }
-  elseif ($status === 'applied') {
-    $fields['applied_at'] = REQUEST_TIME;
-  }
-  if ($error_message !== '') {
-    $fields['error_message'] = $error_message;
-  }
 
   return db_update('ai_agents_maintenance_queue')
     ->fields($fields)
