@@ -124,19 +124,24 @@ function ai_agents_maintenance_cron() {
         if (empty($entry['assistant_id']) || empty($entry['enabled'])) {
           continue;
         }
-        $prompt = !empty($entry['prompt']) ? $entry['prompt'] : 'Run your maintenance scan now and queue any proposals with the maintenance_propose_change tool.';
-        $result = ai_assistants_send($entry['assistant_id'], $prompt);
-        if (!empty($result['error'])) {
-          watchdog('ai_agents_maintenance', 'Assistant @id error: @err', ['@id' => $entry['assistant_id'], '@err' => $result['error']], WATCHDOG_WARNING);
+        try {
+          $prompt = !empty($entry['prompt']) ? $entry['prompt'] : 'Run your maintenance scan now and queue any proposals with the maintenance_propose_change tool.';
+          $result = ai_assistants_send($entry['assistant_id'], $prompt);
+          if (!empty($result['error'])) {
+            watchdog('ai_agents_maintenance', 'Assistant @id error: @err', ['@id' => $entry['assistant_id'], '@err' => $result['error']], WATCHDOG_WARNING);
+          }
+          elseif (!empty($result['status']) && $result['status'] === 'needs_approval') {
+            // A backing agent hit a write tool that pauses for live approval.
+            // Unattended runs should propose via maintenance_propose_change
+            // instead; the pause cannot be answered from cron.
+            watchdog('ai_agents_maintenance', 'Assistant @id paused for tool approval during cron; give its agents the maintenance_propose_change tool instead of direct write tools.', ['@id' => $entry['assistant_id']], WATCHDOG_WARNING);
+          }
+          else {
+            $queued++;
+          }
         }
-        elseif (!empty($result['status']) && $result['status'] === 'needs_approval') {
-          // A backing agent hit a write tool that pauses for live approval.
-          // Unattended runs should propose via maintenance_propose_change
-          // instead; the pause cannot be answered from cron.
-          watchdog('ai_agents_maintenance', 'Assistant @id paused for tool approval during cron; give its agents the maintenance_propose_change tool instead of direct write tools.', ['@id' => $entry['assistant_id']], WATCHDOG_WARNING);
-        }
-        else {
-          $queued++;
+        catch (Exception $e) {
+          watchdog('ai_agents_maintenance', 'Assistant @id threw an exception during cron: @msg', ['@id' => $entry['assistant_id'], '@msg' => $e->getMessage()], WATCHDOG_ERROR);
         }
       }
     }
