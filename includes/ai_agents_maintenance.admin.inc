@@ -263,17 +263,17 @@ function ai_agents_maintenance_settings_form($form, &$form_state) {
   $form['assistants'] = [
     '#type' => 'fieldset',
     '#title' => t('Scheduled assistants'),
-    '#description' => t('Each assistant runs on cron and can use tools to write proposals into the maintenance queue. Configure assistants at <a href="@url">admin/config/ai/assistants</a>.', ['@url' => url('admin/config/ai/assistants')]),
+    '#description' => t('Each assistant runs on cron and can use the maintenance_propose_change tool (enable it on the backing agents) to write proposals into the maintenance queue. Configure assistants at <a href="@url">admin/config/ai/ai-assistants</a>.', ['@url' => url('admin/config/ai/ai-assistants')]),
     '#tree' => TRUE,
   ];
 
-  if (!module_exists('ai_assistant')) {
+  if (!module_exists('ai_assistants')) {
     $form['assistants']['missing'] = [
-      '#markup' => '<p>' . t('<strong>ai_assistant</strong> module is not enabled.') . '</p>',
+      '#markup' => '<p>' . t('<strong>ai_assistants</strong> module is not enabled.') . '</p>',
     ];
   }
   else {
-    $assistant_options = ['' => t('— Select assistant —')] + ai_assistant_options();
+    $assistant_options = ['' => t('— Select assistant —')] + ai_assistants_options();
     $scheduled = $config->get('scheduled_assistants') ?: [];
 
     // Always show at least 3 rows, or one more than currently saved.
