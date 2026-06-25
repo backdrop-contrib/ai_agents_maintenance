@@ -3,9 +3,15 @@
 Provides reviewable maintenance tooling for AI agents, including cron-driven
 scans, an approval queue, and admin screens for applying small cleanup tasks.
 
+Assistants run unattended on cron, write proposals into a review queue using
+the `maintenance_propose_change` tool, and nothing touches site content until
+an administrator approves each proposal.
+
 ## Requirements
 
 - `ai_agents` module
+- `ai_assistants` module (for scheduled assistant runs)
+- `ai_tools` module (for the proposal tools)
 
 ## Installation
 
@@ -17,7 +23,18 @@ scans, an approval queue, and admin screens for applying small cleanup tasks.
 1. Enable the module.
 2. Go to **Administration > Configuration > AI > AI Agents > AI Maintenance**.
 3. Configure cron behavior and scheduled assistants.
-4. Review queued items, approve or reject them, and apply approved changes.
+4. On each backing agent used by a scheduled assistant
+   (**admin/config/ai/ai-agents**), enable the `maintenance_propose_change`
+   and `maintenance_list_proposals` tools so the agent can queue proposals.
+5. Review queued items on the **Queue** tab, approve or reject them, and apply
+   approved changes (cron also applies a batch of approved items per run).
+
+## AI Agent Tools
+
+| Tool | Purpose |
+|---|---|
+| `maintenance_propose_change` | Queue a proposal for human review. `file_alt_from_usage` proposals apply automatically after approval; `recommendation` proposals are advisory. Does not pause agent runs for approval — the queue is the approval gate. |
+| `maintenance_list_proposals` | List queued proposals (filter by status) to avoid duplicates and report queue state. |
 
 ## Issues
 
