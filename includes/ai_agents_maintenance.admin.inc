@@ -88,9 +88,45 @@ function ai_agents_maintenance_dashboard_form_submit($form, &$form_state) {
  * Queue review form.
  */
 function ai_agents_maintenance_queue_form($form, &$form_state) {
-  $items = ai_agents_maintenance_get_queue_items(100);
+  $filter = isset($_GET['status']) ? trim($_GET['status']) : 'active';
+  $status_options = [
+    'active' => t('Active (Pending & Approved)'),
+    'all' => t('All statuses'),
+    'pending' => t('Pending'),
+    'approved' => t('Approved'),
+    'applied' => t('Applied'),
+    'rejected' => t('Rejected'),
+    'failed' => t('Failed'),
+  ];
+
+  $form['filter'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Filter queue'),
+    '#collapsible' => TRUE,
+    '#collapsed' => ($filter === 'active'),
+  ];
+  $form['filter']['status'] = [
+    '#type' => 'select',
+    '#title' => t('Status'),
+    '#options' => $status_options,
+    '#default_value' => $filter,
+  ];
+  $form['filter']['filter_submit'] = [
+    '#type' => 'submit',
+    '#value' => t('Filter'),
+    '#op' => 'filter',
+  ];
+
+  $query_status = '';
+  if ($filter === 'active') {
+    $query_status = ['pending', 'approved'];
+  }
+  elseif ($filter !== 'all' && isset($status_options[$filter])) {
+    $query_status = $filter;
+  }
+
+  $items = ai_agents_maintenance_get_queue_items(100, $query_status);
   $options = [];
-  $rows = [];
 
   foreach ($items as $item) {
     $qid = (int) $item['qid'];
@@ -109,7 +145,7 @@ function ai_agents_maintenance_queue_form($form, &$form_state) {
     '#type' => 'tableselect',
     '#header' => [t('Status'), t('Task'), t('Target'), t('Before'), t('After'), t('Reason'), t('Created')],
     '#options' => $options,
-    '#empty' => t('No maintenance candidates queued.'),
+    '#empty' => t('No maintenance candidates queued matching criteria.'),
   ];
 
   $form['actions'] = ['#type' => 'actions'];
@@ -117,6 +153,11 @@ function ai_agents_maintenance_queue_form($form, &$form_state) {
     '#type' => 'submit',
     '#value' => t('Approve selected'),
     '#op' => 'approve',
+  ];
+  $form['actions']['approve_apply'] = [
+    '#type' => 'submit',
+    '#value' => t('Approve & apply immediately'),
+    '#op' => 'approve_apply',
   ];
   $form['actions']['reject'] = [
     '#type' => 'submit',
@@ -137,8 +178,17 @@ function ai_agents_maintenance_queue_form($form, &$form_state) {
  */
 function ai_agents_maintenance_queue_form_submit($form, &$form_state) {
   $op = !empty($form_state['triggering_element']['#op']) ? $form_state['triggering_element']['#op'] : '';
-  $selected = [];
 
+  if ($op === 'filter') {
+    $status_val = $form_state['values']['status'];
+    $form_state['redirect'] = [
+      'admin/config/ai/ai-agents/maintenance/queue',
+      ['query' => ['status' => $status_val]],
+    ];
+    return;
+  }
+
+  $selected = [];
   if (!empty($form_state['values']['queue']) && is_array($form_state['values']['queue'])) {
     foreach ($form_state['values']['queue'] as $qid => $checked) {
       if ($checked) {
@@ -156,6 +206,18 @@ function ai_agents_maintenance_queue_form_submit($form, &$form_state) {
   if ($op === 'approve') {
     ai_agents_maintenance_update_queue_status($selected, 'approved', $GLOBALS['user']->uid);
     backdrop_set_message(t('Approved @count item(s).', ['@count' => count($selected)]));
+  }
+  elseif ($op === 'approve_apply') {
+    ai_agents_maintenance_update_queue_status($selected, 'approved', $GLOBALS['user']->uid);
+    $applied = 0;
+    foreach (ai_agents_maintenance_get_queue_items(100) as $item) {
+      if (in_array((int) $item['qid'], $selected, TRUE)) {
+        if (ai_agents_maintenance_apply_queue_item($item)) {
+          $applied++;
+        }
+      }
+    }
+    backdrop_set_message(t('Approved and applied @count item(s).', ['@count' => $applied]));
   }
   elseif ($op === 'reject') {
     ai_agents_maintenance_update_queue_status($selected, 'rejected');
@@ -209,21 +271,55 @@ function ai_agents_maintenance_log_form($form, &$form_state) {
  * Format queue target label.
  */
 function _ai_agents_maintenance_item_target_label(array $item) {
-  if (!empty($item['entity_type']) && $item['entity_type'] === 'file') {
-    $file = file_load((int) $item['entity_id']);
+  $entity_type = !empty($item['entity_type']) ? $item['entity_type'] : '';
+  $entity_id = !empty($item['entity_id']) ? (int) $item['entity_id'] : 0;
+
+  if ($entity_type === 'file' && $entity_id) {
+    $file = file_load($entity_id);
     if ($file) {
       return l(check_plain($file->filename), 'file/' . $file->fid . '/manage');
     }
   }
+  elseif ($entity_type === 'node' && $entity_id) {
+    $node = node_load($entity_id);
+    if ($node) {
+      return l(check_plain($node->title), 'node/' . $node->nid);
+    }
+  }
+  elseif ($entity_type === 'taxonomy_term' && $entity_id) {
+    $term = taxonomy_term_load($entity_id);
+    if ($term) {
+      return l(check_plain($term->name), 'taxonomy/term/' . $term->tid);
+    }
+  }
+  elseif ($entity_type === 'user' && $entity_id) {
+    $u = user_load($entity_id);
+    if ($u) {
+      return l(check_plain($u->name), 'user/' . $u->uid);
+    }
+  }
+  elseif ($entity_type === 'site' || empty($entity_type)) {
+    return '<em>' . t('Site / Global') . '</em>';
+  }
 
-  return check_plain($item['entity_type'] . ':' . $item['entity_id']);
+  return check_plain(($entity_type ?: 'unknown') . ':' . $entity_id);
 }
 
 /**
  * Format queue status label.
  */
 function _ai_agents_maintenance_queue_status_label($status) {
-  return check_plain(ucfirst((string) $status));
+  $status = (string) $status;
+  $colors = [
+    'pending' => '#d97706',   // amber
+    'approved' => '#2563eb',  // blue
+    'applied' => '#059669',   // green
+    'rejected' => '#6b7280',  // gray
+    'failed' => '#dc2626',    // red
+  ];
+  $color = isset($colors[$status]) ? $colors[$status] : '#4b5563';
+  return '<span style="display:inline-block;padding:2px 8px;border-radius:3px;background:' . $color . ';color:#fff;font-weight:600;font-size:0.85em;text-transform:uppercase;letter-spacing:0.04em">'
+    . check_plain(ucfirst($status)) . '</span>';
 }
 
 /**
@@ -259,13 +355,73 @@ function ai_agents_maintenance_settings_form($form, &$form_state) {
     '#options' => [1 => 1, 5 => 5, 10 => 10, 25 => 25],
     '#default_value' => $config->get('apply_batch_size') ?: 5,
   ];
+
+  $cron_uid = (int) $config->get('cron_uid');
+  if (empty($cron_uid) || $cron_uid === 1) {
+    $form['cron']['security_advisory'] = [
+      '#type' => 'help',
+      '#markup' => '<div class="messages warning" style="margin: 0.5em 0 1em 0;">'
+        . '<strong>' . t('Security advisory: Principle of Least Privilege') . '</strong><br />'
+        . t('Unattended cron runs currently default to User 1 (superuser), granting unrestricted access to all site content and administrative configuration. To harden site security against accidental drift or unintended edits, select or create a dedicated service account holding only the permissions required for maintenance.')
+        . '</div>',
+    ];
+  }
+
+  $user_options = [
+    0 => t('— Default (User 1: Superuser) —'),
+  ];
+  $accounts = db_query('SELECT uid, name FROM {users} WHERE status = 1 AND uid > 0 ORDER BY uid ASC LIMIT 50')->fetchAllKeyed(0, 1);
+  foreach ($accounts as $uid => $name) {
+    $u = user_load($uid);
+    $is_super = ($uid == 1);
+    $has_maint = user_access('administer ai maintenance', $u);
+    $label = $is_super ? t('User 1: @name (Superuser)', ['@name' => $name]) : t('UID @uid: @name (@perm)', [
+      '@uid' => $uid,
+      '@name' => $name,
+      '@perm' => $has_maint ? t('Maintenance Admin') : t('Standard User'),
+    ]);
+    $user_options[$uid] = $label;
+  }
+
+  $form['cron']['cron_uid_select'] = [
+    '#type' => 'select',
+    '#title' => t('Cron service account'),
+    '#options' => $user_options,
+    '#default_value' => isset($user_options[$cron_uid]) ? $cron_uid : 0,
+    '#description' => t('Select an active account with maintenance permissions, or specify a custom UID below.'),
+  ];
   $form['cron']['cron_uid'] = [
     '#type' => 'textfield',
-    '#title' => t('Cron service account UID'),
-    '#description' => t('User ID to impersonate during scheduled assistant runs. Create a dedicated account with only the permissions required for maintenance tasks rather than using uid 1. Defaults to 1 if left empty.'),
-    '#default_value' => $config->get('cron_uid') ?: '',
+    '#title' => t('Custom service account UID'),
+    '#description' => t('Specify a custom UID to impersonate. Overrides dropdown selection if entered.'),
+    '#default_value' => $cron_uid ? $cron_uid : '',
     '#size' => 10,
     '#element_validate' => ['element_validate_integer_positive'],
+  ];
+
+  $tasks = ai_agents_maintenance_get_task_info();
+  $task_rows = [];
+  foreach ($tasks as $id => $info) {
+    $task_rows[] = [
+      '<code>' . check_plain($id) . '</code>',
+      check_plain($info['label']),
+      !empty($info['entity_type']) ? check_plain($info['entity_type']) : '<em>' . t('Global / Site') . '</em>',
+      !empty($info['has_automatic_apply']) ? t('Yes (Automated)') : t('No (Advisory)'),
+      check_plain($info['description']),
+    ];
+  }
+
+  $form['registered_tasks'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Registered maintenance task handlers (@count)', ['@count' => count($tasks)]),
+    '#description' => t('Modules register task handlers via <code>hook_ai_agents_maintenance_task_info()</code>. These determine how proposals are validated and applied.'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  ];
+  $form['registered_tasks']['table'] = [
+    '#theme' => 'table',
+    '#header' => [t('Task Type'), t('Label'), t('Entity Target'), t('Auto-Apply'), t('Description')],
+    '#rows' => $task_rows,
   ];
 
   $form['assistants'] = [
@@ -352,7 +508,10 @@ function ai_agents_maintenance_settings_form_submit($form, &$form_state) {
   $config->set('cron_enabled', !empty($form_state['values']['cron_enabled']) ? 1 : 0);
   $config->set('cron_interval', (int) $form_state['values']['cron_interval']);
   $config->set('apply_batch_size', (int) $form_state['values']['apply_batch_size']);
-  $cron_uid = (int) $form_state['values']['cron_uid'];
+
+  $cron_uid_select = isset($form_state['values']['cron_uid_select']) ? (int) $form_state['values']['cron_uid_select'] : 0;
+  $cron_uid_custom = isset($form_state['values']['cron_uid']) ? (int) $form_state['values']['cron_uid'] : 0;
+  $cron_uid = $cron_uid_custom > 0 ? $cron_uid_custom : $cron_uid_select;
   $config->set('cron_uid', $cron_uid > 0 ? $cron_uid : 0);
 
   $scheduled = [];

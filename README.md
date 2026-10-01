@@ -33,8 +33,54 @@ an administrator approves each proposal.
 
 | Tool | Purpose |
 |---|---|
-| `maintenance_propose_change` | Queue a proposal for human review. `file_alt_from_usage` proposals apply automatically after approval; `recommendation` proposals are advisory. Does not pause agent runs for approval — the queue is the approval gate. |
-| `maintenance_list_proposals` | List queued proposals (filter by status) to avoid duplicates and report queue state. |
+| `maintenance_propose_change` | Queue a proposal for human review. Built-in task types: `file_alt_from_usage`, `recommendation`, `node_publish_status`, `node_field_update`, and `taxonomy_term_assign`. Does not pause agent runs for live approval — the queue serves as the human-in-the-loop approval gate. |
+| `maintenance_list_proposals` | List queued proposals (filterable by status: `pending`, `approved`, `applied`, `rejected`, `failed`) to avoid duplicates and report queue state back to agents. |
+
+## Pluggable Task Handlers API
+
+Other modules (such as `ai_content_audit`, `ai_seo_advisor`, or custom site features) can register custom maintenance task types using `hook_ai_agents_maintenance_task_info()`:
+
+```php
+/**
+ * Implements hook_ai_agents_maintenance_task_info().
+ */
+function mymodule_ai_agents_maintenance_task_info() {
+  return [
+    'custom_cleanup_task' => [
+      'label' => t('Custom Cleanup Task'),
+      'description' => t('Executes automated site hygiene upon admin approval.'),
+      'entity_type' => 'node',
+      'has_automatic_apply' => TRUE,
+      'apply_callback' => 'mymodule_apply_cleanup_task',
+    ],
+  ];
+}
+
+/**
+ * Task execution callback.
+ */
+function mymodule_apply_cleanup_task(array &$item, &$error = '') {
+  // Apply changes safely with optimistic concurrency checks.
+  // Return TRUE on success, or set $error and return FALSE.
+  return TRUE;
+}
+```
+
+Registered task types are automatically added to the `maintenance_propose_change` tool's schema and displayed in the administrative task matrix at **Admin > Configuration > AI > AI Agents > AI Maintenance > Settings**.
+
+## Security & Service Accounts
+
+Unattended cron processes run in the anonymous session context. To allow scheduled assistants and agents to read site content and propose changes, the module temporarily switches execution context to a configured service account.
+
+To adhere to the **Principle of Least Privilege**, configure a dedicated service account with only the necessary permissions (`administer ai maintenance`, plus required content view/edit permissions) rather than defaulting to User 1 (superuser).
+
+## Automated Testing
+
+To run the verification test suite:
+
+```bash
+ddev exec php modules/contrib/ai_agents_maintenance/tests/test_maintenance.php
+```
 
 ## Issues
 
