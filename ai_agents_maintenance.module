@@ -86,6 +86,89 @@ function ai_agents_maintenance_config_info() {
 }
 
 /**
+ * Implements hook_hook_info().
+ */
+function ai_agents_maintenance_hook_info() {
+  $hooks['ai_agents_maintenance_task_info'] = [
+    'group' => 'ai',
+  ];
+  $hooks['ai_agents_maintenance_task_info_alter'] = [
+    'group' => 'ai',
+  ];
+  return $hooks;
+}
+
+/**
+ * Return all registered maintenance task definitions.
+ *
+ * Invokes hook_ai_agents_maintenance_task_info() across all modules and
+ * allows alteration via hook_ai_agents_maintenance_task_info_alter().
+ *
+ * @param string|null $task_type
+ *   Optional task type machine name to look up.
+ *
+ * @return array
+ *   Array of task definitions or single task definition array, keyed by task type.
+ */
+function ai_agents_maintenance_get_task_info($task_type = NULL) {
+  $tasks = &backdrop_static(__FUNCTION__);
+
+  if (!isset($tasks)) {
+    $tasks = module_invoke_all('ai_agents_maintenance_task_info');
+    backdrop_alter('ai_agents_maintenance_task_info', $tasks);
+  }
+
+  if ($task_type !== NULL) {
+    return isset($tasks[$task_type]) ? $tasks[$task_type] : NULL;
+  }
+
+  return $tasks;
+}
+
+/**
+ * Implements hook_ai_agents_maintenance_task_info().
+ */
+function ai_agents_maintenance_ai_agents_maintenance_task_info() {
+  return [
+    'file_alt_from_usage' => [
+      'label' => t('File alt text from usage'),
+      'description' => t('Apply alt text to an image file based on prior site usage.'),
+      'entity_type' => 'file',
+      'apply_callback' => 'ai_agents_maintenance_task_apply_file_alt',
+      'has_automatic_apply' => TRUE,
+    ],
+    'recommendation' => [
+      'label' => t('Advisory recommendation'),
+      'description' => t('Advisory finding for human review; marked applied when acknowledged.'),
+      'entity_type' => '',
+      'apply_callback' => 'ai_agents_maintenance_task_apply_recommendation',
+      'has_automatic_apply' => TRUE,
+    ],
+    'node_publish_status' => [
+      'label' => t('Node publication status'),
+      'description' => t('Publish or unpublish a node (e.g. unpublishing obsolete or stale content).'),
+      'entity_type' => 'node',
+      'apply_callback' => 'ai_agents_maintenance_task_apply_node_status',
+      'has_automatic_apply' => TRUE,
+    ],
+    'node_field_update' => [
+      'label' => t('Node field update'),
+      'description' => t('Update a specific field value on a node (such as summary or meta description).'),
+      'entity_type' => 'node',
+      'apply_callback' => 'ai_agents_maintenance_task_apply_node_field',
+      'has_automatic_apply' => TRUE,
+    ],
+    'taxonomy_term_assign' => [
+      'label' => t('Assign taxonomy term'),
+      'description' => t('Assign a taxonomy term to an entity field.'),
+      'entity_type' => 'node',
+      'apply_callback' => 'ai_agents_maintenance_task_apply_taxonomy_term',
+      'has_automatic_apply' => TRUE,
+    ],
+  ];
+}
+
+/**
  * Implements hook_cron().
  */
 function ai_agents_maintenance_cron() {
@@ -104,44 +187,50 @@ function ai_agents_maintenance_cron() {
   $apply_limit = (int) ($config->get('apply_batch_size') ?: 5);
   $queued = 0;
 
-  // Run each configured assistant.
+  // Run each configured assistant or agent.
   $scheduled = $config->get('scheduled_assistants');
-  if (!empty($scheduled) && is_array($scheduled) && module_exists('ai_assistants')) {
-    // Assistants enforce allowed_roles against the current user, and ai_tools
-    // filters tools by permission. Cron runs as anonymous, so impersonate a
-    // dedicated service account for the scheduled runs and restore afterwards.
-    // Defaults to uid 1 when no service account is configured; set
-    // cron_uid in the module settings to use a least-privilege account.
+  if (!empty($scheduled) && is_array($scheduled)) {
     global $user;
     $original_user = $user;
     $session_state = backdrop_save_session();
     backdrop_save_session(FALSE);
     $cron_uid = (int) ($config->get('cron_uid') ?: 1);
+    if ($cron_uid === 1) {
+      watchdog('ai_agents_maintenance', 'Cron running with superuser (UID 1). To adhere to least-privilege security standards, configure a dedicated service account in AI Maintenance settings.', [], WATCHDOG_NOTICE);
+    }
     $user = user_load($cron_uid) ?: user_load(1);
 
     try {
       foreach ($scheduled as $entry) {
-        if (empty($entry['assistant_id']) || empty($entry['enabled'])) {
+        $assistant_id = !empty($entry['assistant_id']) ? $entry['assistant_id'] : '';
+        $agent_id = !empty($entry['agent_id']) ? $entry['agent_id'] : '';
+        if (empty($entry['enabled']) || (empty($assistant_id) && empty($agent_id))) {
           continue;
         }
         try {
           $prompt = !empty($entry['prompt']) ? $entry['prompt'] : 'Run your maintenance scan now and queue any proposals with the maintenance_propose_change tool.';
-          $result = ai_assistants_send($entry['assistant_id'], $prompt);
+          $result = NULL;
+
+          if (!empty($assistant_id) && module_exists('ai_assistants')) {
+            $result = ai_assistants_send($assistant_id, $prompt);
+          }
+          elseif (!empty($agent_id) && module_exists('ai_agents')) {
+            $result = ai_agents_run($agent_id, $prompt);
+          }
+
           if (!empty($result['error'])) {
-            watchdog('ai_agents_maintenance', 'Assistant @id error: @err', ['@id' => $entry['assistant_id'], '@err' => $result['error']], WATCHDOG_WARNING);
+            watchdog('ai_agents_maintenance', 'Scheduled task @id error: @err', ['@id' => ($assistant_id ?: $agent_id), '@err' => $result['error']], WATCHDOG_WARNING);
           }
           elseif (!empty($result['status']) && $result['status'] === 'needs_approval') {
             // A backing agent hit a write tool that pauses for live approval.
-            // Unattended runs should propose via maintenance_propose_change
-            // instead; the pause cannot be answered from cron.
-            watchdog('ai_agents_maintenance', 'Assistant @id paused for tool approval during cron; give its agents the maintenance_propose_change tool instead of direct write tools.', ['@id' => $entry['assistant_id']], WATCHDOG_WARNING);
+            watchdog('ai_agents_maintenance', 'Scheduled task @id paused for tool approval during cron; give its agents the maintenance_propose_change tool instead of direct write tools.', ['@id' => ($assistant_id ?: $agent_id)], WATCHDOG_WARNING);
           }
           else {
             $queued++;
           }
         }
         catch (Exception $e) {
-          watchdog('ai_agents_maintenance', 'Assistant @id threw an exception during cron: @msg', ['@id' => $entry['assistant_id'], '@msg' => $e->getMessage()], WATCHDOG_ERROR);
+          watchdog('ai_agents_maintenance', 'Scheduled task @id threw an exception during cron: @msg', ['@id' => ($assistant_id ?: $agent_id), '@msg' => $e->getMessage()], WATCHDOG_ERROR);
         }
       }
     }
@@ -154,7 +243,7 @@ function ai_agents_maintenance_cron() {
   $applied = ai_agents_maintenance_apply_approved_items($apply_limit);
   $config->set('cron_last_run', REQUEST_TIME)->save();
 
-  watchdog('ai_agents_maintenance', 'Cron: ran @queued assistant(s), applied @applied item(s).', [
+  watchdog('ai_agents_maintenance', 'Cron: ran @queued maintenance task(s), applied @applied item(s).', [
     '@queued' => $queued,
     '@applied' => $applied,
   ]);
@@ -177,32 +266,43 @@ function ai_agents_maintenance_run_id() {
  * gate — nothing touches site content until an admin approves the row.
  */
 function ai_agents_maintenance_ai_tools() {
+  $tasks = ai_agents_maintenance_get_task_info();
+  $task_keys = array_keys($tasks);
+  $task_descriptions = [];
+  foreach ($tasks as $key => $info) {
+    $task_descriptions[] = $key . ' (' . $info['label'] . ' - ' . $info['description'] . ')';
+  }
+
   return [
     'maintenance_propose_change' => [
       'definition' => [
         'type' => 'function',
         'function' => [
           'name' => 'maintenance_propose_change',
-          'description' => 'Queue a maintenance proposal for human review on the AI Maintenance queue. Nothing changes on the site until an administrator approves the proposal. Use task_type "file_alt_from_usage" to propose alt text for a file (entity_type "file", entity_id = fid, after_value = the proposed alt text). Use task_type "recommendation" for any advisory finding a human should act on (after_value = the recommended action).',
+          'description' => 'Queue a maintenance proposal for human review on the AI Maintenance queue. Nothing changes on the site until an administrator approves the proposal. Supported task types: ' . implode('; ', $task_descriptions),
           'parameters' => [
             'type' => 'object',
             'properties' => [
               'task_type' => [
                 'type' => 'string',
-                'enum' => ['file_alt_from_usage', 'recommendation'],
-                'description' => 'file_alt_from_usage applies automatically after approval; recommendation is advisory only.',
+                'enum' => $task_keys,
+                'description' => 'Maintenance task type. Available: ' . implode(', ', $task_keys),
               ],
               'entity_type' => [
                 'type' => 'string',
-                'description' => 'Target entity type, e.g. file or node.',
+                'description' => 'Target entity type, e.g. file or node (leave empty or "site" for site-wide recommendations).',
               ],
               'entity_id' => [
                 'type' => 'integer',
-                'description' => 'Target entity id (fid for files, nid for nodes).',
+                'description' => 'Target entity id (fid for files, nid for nodes, 0 for site-wide recommendations).',
+              ],
+              'bundle' => [
+                'type' => 'string',
+                'description' => 'Target bundle or field name (e.g. field_tags or image).',
               ],
               'before_value' => [
                 'type' => 'string',
-                'description' => 'Current value, when known. Looked up automatically for file alt text.',
+                'description' => 'Current value, when known. Checked before apply to guard against concurrent edits.',
               ],
               'after_value' => [
                 'type' => 'string',
@@ -213,7 +313,7 @@ function ai_agents_maintenance_ai_tools() {
                 'description' => 'Why this change is proposed — shown to the reviewing administrator.',
               ],
             ],
-            'required' => ['task_type', 'entity_type', 'entity_id', 'after_value', 'reason'],
+            'required' => ['task_type', 'after_value', 'reason'],
           ],
         ],
       ],
@@ -259,31 +359,83 @@ function ai_agents_maintenance_execute_propose_change(array $args) {
   $task_type = isset($args['task_type']) ? trim((string) $args['task_type']) : '';
   $entity_type = isset($args['entity_type']) ? trim((string) $args['entity_type']) : '';
   $entity_id = isset($args['entity_id']) ? (int) $args['entity_id'] : 0;
+  $bundle = isset($args['bundle']) ? trim((string) $args['bundle']) : '';
   $before_value = isset($args['before_value']) ? trim((string) $args['before_value']) : '';
   $after_value = isset($args['after_value']) ? trim((string) $args['after_value']) : '';
   $reason = isset($args['reason']) ? trim((string) $args['reason']) : '';
 
-  if (!in_array($task_type, ['file_alt_from_usage', 'recommendation'], TRUE)) {
-    return ['error' => 'task_type must be file_alt_from_usage or recommendation.'];
+  $tasks = ai_agents_maintenance_get_task_info();
+  if (empty($task_type) || !isset($tasks[$task_type])) {
+    return ['error' => 'Invalid or unsupported task_type: ' . $task_type];
   }
-  if ($entity_type === '' || !$entity_id || $after_value === '' || $reason === '') {
-    return ['error' => 'entity_type, entity_id, after_value, and reason are required.'];
+  if ($after_value === '' || $reason === '') {
+    return ['error' => 'after_value and reason are required.'];
   }
 
-  $bundle = '';
+  $task_info = $tasks[$task_type];
+  $expected_entity_type = !empty($task_info['entity_type']) ? $task_info['entity_type'] : '';
+
+  if ($expected_entity_type !== '') {
+    if ($entity_type === '') {
+      $entity_type = $expected_entity_type;
+    }
+    elseif ($entity_type !== $expected_entity_type) {
+      return ['error' => "task_type '$task_type' requires entity_type '$expected_entity_type'."];
+    }
+    if (!$entity_id) {
+      return ['error' => "entity_id is required for task_type '$task_type'."];
+    }
+  }
+
   $source_fid = 0;
   if ($task_type === 'file_alt_from_usage') {
-    if ($entity_type !== 'file') {
-      return ['error' => 'file_alt_from_usage proposals must target entity_type "file".'];
-    }
     $file = file_load($entity_id);
     if (!$file) {
       return ['error' => "File $entity_id was not found."];
     }
-    $bundle = !empty($file->type) ? $file->type : 'image';
+    $bundle = !empty($file->type) ? $file->type : ($bundle ?: 'image');
     $source_fid = (int) $file->fid;
     if ($before_value === '') {
       $before_value = ai_agents_maintenance_current_file_alt($file);
+    }
+  }
+  elseif ($task_type === 'node_publish_status') {
+    $node = node_load($entity_id);
+    if (!$node) {
+      return ['error' => "Node $entity_id was not found."];
+    }
+    if (empty($bundle)) {
+      $bundle = $node->type;
+    }
+    if ($before_value === '') {
+      $before_value = !empty($node->status) ? 'published' : 'unpublished';
+    }
+  }
+  elseif ($task_type === 'node_field_update') {
+    $node = node_load($entity_id);
+    if (!$node) {
+      return ['error' => "Node $entity_id was not found."];
+    }
+    if (empty($bundle)) {
+      return ['error' => 'bundle (target field name) is required for node_field_update.'];
+    }
+    if ($before_value === '' && isset($node->{$bundle})) {
+      $lang = !empty($node->language) ? $node->language : LANGUAGE_NONE;
+      if (!empty($node->{$bundle}[$lang][0]['value'])) {
+        $before_value = $node->{$bundle}[$lang][0]['value'];
+      }
+      elseif (!empty($node->{$bundle}[LANGUAGE_NONE][0]['value'])) {
+        $before_value = $node->{$bundle}[LANGUAGE_NONE][0]['value'];
+      }
+    }
+  }
+  elseif ($task_type === 'taxonomy_term_assign') {
+    $node = node_load($entity_id);
+    if (!$node) {
+      return ['error' => "Node $entity_id was not found."];
+    }
+    if (empty($bundle)) {
+      $bundle = 'field_tags';
     }
   }
 
@@ -471,6 +623,13 @@ function ai_agents_maintenance_current_file_alt($file) {
   if (function_exists('ai_alt_tools_get_file_alt_text')) {
     return ai_alt_tools_get_file_alt_text($file);
   }
+  $alt_field = function_exists('image_entity_alt_field_name') ? image_entity_alt_field_name() : 'field_alt';
+  if (!empty($file->{$alt_field}[LANGUAGE_NONE][0]['value'])) {
+    return trim($file->{$alt_field}[LANGUAGE_NONE][0]['value']);
+  }
+  if (!empty($file->alt)) {
+    return trim($file->alt);
+  }
   return '';
 }
 
@@ -506,14 +665,27 @@ function ai_agents_maintenance_queue_insert(array $values) {
 
 /**
  * Return queue items.
+ *
+ * @param int $limit
+ *   Max items to return.
+ * @param string|array $status
+ *   Single status string or array of status strings.
+ *
+ * @return array
+ *   Queue rows keyed by qid.
  */
 function ai_agents_maintenance_get_queue_items($limit = 50, $status = '') {
   $query = db_select('ai_agents_maintenance_queue', 'q')
     ->fields('q')
     ->orderBy('created', 'DESC')
     ->range(0, (int) $limit);
-  if ($status !== '') {
-    $query->condition('status', $status);
+  if (!empty($status)) {
+    if (is_array($status)) {
+      $query->condition('status', $status, 'IN');
+    }
+    else {
+      $query->condition('status', $status);
+    }
   }
   return $query->execute()->fetchAllAssoc('qid', PDO::FETCH_ASSOC);
 }
@@ -584,16 +756,36 @@ function ai_agents_maintenance_apply_approved_items($limit = 5) {
 }
 
 /**
- * Apply one queue row.
+ * Apply one queue row via pluggable task handler.
+ *
+ * @param array $item
+ *   Queue row array.
+ *
+ * @return bool
+ *   TRUE on successful apply, FALSE on failure.
  */
 function ai_agents_maintenance_apply_queue_item(array $item) {
   if (empty($item['qid'])) {
     return FALSE;
   }
 
-  if ($item['task_type'] === 'recommendation') {
-    // Advisory only: applying records that the recommendation was reviewed
-    // and accepted. There is nothing to execute.
+  $task_info = ai_agents_maintenance_get_task_info($item['task_type']);
+  if (!$task_info || empty($task_info['apply_callback']) || !is_callable($task_info['apply_callback'])) {
+    ai_agents_maintenance_update_queue_status([(int) $item['qid']], 'failed', 0, 'Unsupported or uncallable task handler for: ' . $item['task_type']);
+    return FALSE;
+  }
+
+  $error_message = '';
+  $callback = $task_info['apply_callback'];
+  try {
+    $success = call_user_func_array($callback, [&$item, &$error_message]);
+  }
+  catch (Exception $e) {
+    $success = FALSE;
+    $error_message = $e->getMessage();
+  }
+
+  if ($success) {
     db_update('ai_agents_maintenance_queue')
       ->fields([
         'status' => 'applied',
@@ -603,23 +795,35 @@ function ai_agents_maintenance_apply_queue_item(array $item) {
       ])
       ->condition('qid', (int) $item['qid'])
       ->execute();
+
+    watchdog('ai_agents_maintenance', 'Applied queued maintenance item @qid (@type on @entity_type:@entity_id).', [
+      '@qid' => $item['qid'],
+      '@type' => $item['task_type'],
+      '@entity_type' => $item['entity_type'],
+      '@entity_id' => $item['entity_id'],
+    ]);
     return TRUE;
   }
-
-  if ($item['task_type'] !== 'file_alt_from_usage') {
-    return FALSE;
-  }
-
-  $file = file_load((int) $item['entity_id']);
-  if (!$file) {
+  else {
     db_update('ai_agents_maintenance_queue')
       ->fields([
         'status' => 'failed',
         'updated' => REQUEST_TIME,
-        'error_message' => 'File no longer exists.',
+        'error_message' => $error_message !== '' ? $error_message : 'Apply failed.',
       ])
       ->condition('qid', (int) $item['qid'])
       ->execute();
+    return FALSE;
+  }
+}
+
+/**
+ * Task handler: Apply file alt text from usage.
+ */
+function ai_agents_maintenance_task_apply_file_alt(array &$item, &$error = '') {
+  $file = file_load((int) $item['entity_id']);
+  if (!$file) {
+    $error = 'File no longer exists.';
     return FALSE;
   }
 
@@ -628,26 +832,12 @@ function ai_agents_maintenance_apply_queue_item(array $item) {
   $new_value = isset($item['after_value']) ? trim((string) $item['after_value']) : '';
 
   if ($new_value === '') {
-    db_update('ai_agents_maintenance_queue')
-      ->fields([
-        'status' => 'failed',
-        'updated' => REQUEST_TIME,
-        'error_message' => 'Queued alt text was empty.',
-      ])
-      ->condition('qid', (int) $item['qid'])
-      ->execute();
+    $error = 'Queued alt text was empty.';
     return FALSE;
   }
 
   if ($current !== '' && $current !== $new_value && $current !== $expected_before) {
-    db_update('ai_agents_maintenance_queue')
-      ->fields([
-        'status' => 'failed',
-        'updated' => REQUEST_TIME,
-        'error_message' => 'Current alt text changed before apply.',
-      ])
-      ->condition('qid', (int) $item['qid'])
-      ->execute();
+    $error = 'Current alt text changed before apply.';
     return FALSE;
   }
 
@@ -666,20 +856,149 @@ function ai_agents_maintenance_apply_queue_item(array $item) {
     file_save($file);
   }
 
-  db_update('ai_agents_maintenance_queue')
-    ->fields([
-      'status' => 'applied',
-      'updated' => REQUEST_TIME,
-      'applied_at' => REQUEST_TIME,
-      'error_message' => '',
-    ])
-    ->condition('qid', (int) $item['qid'])
-    ->execute();
+  return TRUE;
+}
 
-  watchdog('ai_agents_maintenance', 'Applied queued maintenance item @qid to fid @fid.', [
-    '@qid' => $item['qid'],
-    '@fid' => $file->fid,
-  ]);
+/**
+ * Task handler: Advisory recommendation.
+ */
+function ai_agents_maintenance_task_apply_recommendation(array &$item, &$error = '') {
+  // Advisory only: applying records that the recommendation was reviewed and accepted.
+  return TRUE;
+}
 
+/**
+ * Task handler: Node publication status.
+ */
+function ai_agents_maintenance_task_apply_node_status(array &$item, &$error = '') {
+  $node = node_load((int) $item['entity_id']);
+  if (!$node) {
+    $error = 'Node no longer exists.';
+    return FALSE;
+  }
+
+  $expected_before = isset($item['before_value']) ? strtolower(trim((string) $item['before_value'])) : '';
+  $new_value = isset($item['after_value']) ? strtolower(trim((string) $item['after_value'])) : '';
+
+  $target_status = ($new_value === '1' || $new_value === 'published' || $new_value === 'publish') ? 1 : 0;
+  $expected_status = ($expected_before === '1' || $expected_before === 'published' || $expected_before === 'publish') ? 1 : ($expected_before === '' ? NULL : 0);
+
+  if ($expected_status !== NULL && (int) $node->status !== $expected_status) {
+    $error = 'Current node publication status changed before apply.';
+    return FALSE;
+  }
+
+  $node->status = $target_status;
+  node_save($node);
+  return TRUE;
+}
+
+/**
+ * Task handler: Node field update.
+ */
+function ai_agents_maintenance_task_apply_node_field(array &$item, &$error = '') {
+  $node = node_load((int) $item['entity_id']);
+  if (!$node) {
+    $error = 'Node no longer exists.';
+    return FALSE;
+  }
+
+  $field_name = !empty($item['bundle']) ? trim((string) $item['bundle']) : '';
+  if ($field_name === '') {
+    $error = 'Target field name must be specified in the bundle attribute.';
+    return FALSE;
+  }
+
+  $expected_before = isset($item['before_value']) ? trim((string) $item['before_value']) : '';
+  $new_value = isset($item['after_value']) ? trim((string) $item['after_value']) : '';
+
+  $lang = !empty($node->language) ? $node->language : LANGUAGE_NONE;
+  $current_value = '';
+  if (!empty($node->{$field_name}[$lang][0]['value'])) {
+    $current_value = trim($node->{$field_name}[$lang][0]['value']);
+  }
+  elseif (!empty($node->{$field_name}[LANGUAGE_NONE][0]['value'])) {
+    $current_value = trim($node->{$field_name}[LANGUAGE_NONE][0]['value']);
+    $lang = LANGUAGE_NONE;
+  }
+
+  if ($expected_before !== '' && $current_value !== '' && $current_value !== $expected_before && $current_value !== $new_value) {
+    $error = 'Current field value changed before apply.';
+    return FALSE;
+  }
+
+  $node->{$field_name}[$lang][0]['value'] = $new_value;
+  node_save($node);
+  return TRUE;
+}
+
+/**
+ * Task handler: Assign taxonomy term to node.
+ */
+function ai_agents_maintenance_task_apply_taxonomy_term(array &$item, &$error = '') {
+  $node = node_load((int) $item['entity_id']);
+  if (!$node) {
+    $error = 'Node no longer exists.';
+    return FALSE;
+  }
+
+  $field_name = !empty($item['bundle']) ? trim((string) $item['bundle']) : 'field_tags';
+  $term_input = isset($item['after_value']) ? trim((string) $item['after_value']) : '';
+  if ($term_input === '') {
+    $error = 'Term name or ID was empty.';
+    return FALSE;
+  }
+
+  $tid = 0;
+  if (is_numeric($term_input)) {
+    $tid = (int) $term_input;
+  }
+  else {
+    $field_info = field_info_field($field_name);
+    $vocab_name = !empty($field_info['settings']['allowed_values'][0]['vocabulary']) ? $field_info['settings']['allowed_values'][0]['vocabulary'] : 'tags';
+    $terms = taxonomy_get_term_by_name($term_input, $vocab_name);
+    if (!empty($terms)) {
+      $term = reset($terms);
+      $tid = (int) $term->tid;
+    }
+    else {
+      $term = new TaxonomyTerm([
+        'name' => $term_input,
+        'vocabulary' => $vocab_name,
+      ]);
+      taxonomy_term_save($term);
+      $tid = (int) $term->tid;
+    }
+  }
+
+  if (!$tid) {
+    $error = 'Could not locate or create taxonomy term.';
+    return FALSE;
+  }
+
+  $lang = !empty($node->language) ? $node->language : LANGUAGE_NONE;
+  $existing_tids = [];
+  if (!empty($node->{$field_name}[$lang])) {
+    foreach ($node->{$field_name}[$lang] as $item_val) {
+      if (!empty($item_val['tid'])) {
+        $existing_tids[] = (int) $item_val['tid'];
+      }
+    }
+  }
+  elseif (!empty($node->{$field_name}[LANGUAGE_NONE])) {
+    $lang = LANGUAGE_NONE;
+    foreach ($node->{$field_name}[LANGUAGE_NONE] as $item_val) {
+      if (!empty($item_val['tid'])) {
+        $existing_tids[] = (int) $item_val['tid'];
+      }
+    }
+  }
+
+  if (in_array($tid, $existing_tids, TRUE)) {
+    return TRUE;
+  }
+
+  $node->{$field_name}[$lang][] = ['tid' => $tid];
+  node_save($node);
   return TRUE;
 }
