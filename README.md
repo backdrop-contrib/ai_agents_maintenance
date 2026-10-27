@@ -9,6 +9,7 @@ an administrator approves each proposal.
 
 ## Requirements
 
+- PHP 8.2 or later
 - `ai_agents` module
 - `ai_assistants` module (for scheduled assistant runs)
 - `ai_tools` module (for the proposal tools)
@@ -76,10 +77,10 @@ To adhere to the **Principle of Least Privilege**, configure a dedicated service
 
 ## Automated Testing
 
-To run the verification test suite:
+To run the verification test suite from the Backdrop root directory:
 
 ```bash
-ddev exec php modules/contrib/ai_agents_maintenance/tests/test_maintenance.php
+php modules/contrib/ai_agents_maintenance/tests/test_maintenance.php
 ```
 
 ## Issues
