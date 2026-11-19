@@ -1,11 +1,10 @@
 # AI Agents Maintenance
 
-Provides reviewable maintenance tooling for AI agents, including cron-driven
-scans, an approval queue, and admin screens for applying small cleanup tasks.
+Schedule AI assistants to look for site cleanup tasks, such as missing image
+alt text. Review their proposals in a queue before applying approved changes.
 
-Assistants run unattended on cron, write proposals into a review queue using
-the `maintenance_propose_change` tool, and nothing touches site content until
-an administrator approves each proposal.
+Scheduled assistants use `maintenance_propose_change` to queue proposals.
+The maintenance queue requires administrator approval before it applies a change.
 
 ## Requirements
 
@@ -23,12 +22,17 @@ an administrator approves each proposal.
 
 1. Enable the module.
 2. Go to **Administration > Configuration > AI > AI Agents > AI Maintenance**.
-3. Configure cron behavior and scheduled assistants.
+3. In **Settings**, select a dedicated cron service account and configure
+   scheduling. Enable each assistant you want to run and set its trigger prompt.
 4. On each backing agent used by a scheduled assistant
    (**admin/config/ai/ai-agents**), enable the `maintenance_propose_change`
    and `maintenance_list_proposals` tools so the agent can queue proposals.
 5. Review queued items on the **Queue** tab, approve or reject them, and apply
    approved changes (cron also applies a batch of approved items per run).
+
+## Documentation
+
+Find setup, examples, and troubleshooting in the [project wiki](https://github.com/backdrop-contrib/ai_agents_maintenance/wiki).
 
 ## AI Agent Tools
 
